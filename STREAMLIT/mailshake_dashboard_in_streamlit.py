@@ -23,12 +23,41 @@ def get_teams():
     return session.sql(query).to_pandas()
 
 
-def build_where_clause(selected_team: str, timestamp_column: str = "UPDATE_DTS") -> str:
+@st.cache_data(ttl=300)
+def get_campaign_titles(selected_team: str):
+    if selected_team == "ALL":
+        query = """
+            SELECT DISTINCT CAMPAIGN_TITLE
+            FROM MAILSHAKE_API.MAIL_API.ACTIVITY_SENT_TGT
+            WHERE CAMPAIGN_TITLE IS NOT NULL
+            ORDER BY CAMPAIGN_TITLE
+        """
+    else:
+        safe_team = str(selected_team).replace("'", "''")
+        query = f"""
+            SELECT DISTINCT CAMPAIGN_TITLE
+            FROM MAILSHAKE_API.MAIL_API.ACTIVITY_SENT_TGT
+            WHERE CAMPAIGN_TITLE IS NOT NULL
+              AND TEAM_ID = '{safe_team}'
+            ORDER BY CAMPAIGN_TITLE
+        """
+    return session.sql(query).to_pandas()
+
+
+def build_where_clause(
+    selected_team: str,
+    selected_campaign_title: str = "ALL",
+    timestamp_column: str = "UPDATE_DTS"
+) -> str:
     where_clause = f"WHERE {timestamp_column} >= DATEADD(hour, -24, CURRENT_TIMESTAMP())"
 
     if selected_team != "ALL":
         safe_team = str(selected_team).replace("'", "''")
         where_clause += f" AND TEAM_ID = '{safe_team}'"
+
+    if selected_campaign_title != "ALL":
+        safe_title = str(selected_campaign_title).replace("'", "''")
+        where_clause += f" AND CAMPAIGN_TITLE = '{safe_title}'"
 
     return where_clause
 
@@ -38,10 +67,15 @@ def run_metric_query(
     table_name: str,
     metric_name: str,
     selected_team: str,
+    selected_campaign_title: str,
     distinct_email: bool = False,
     timestamp_column: str = "UPDATE_DTS",
 ):
-    where_clause = build_where_clause(selected_team, timestamp_column=timestamp_column)
+    where_clause = build_where_clause(
+        selected_team,
+        selected_campaign_title=selected_campaign_title,
+        timestamp_column=timestamp_column
+    )
     table_name = f"{table_name}_TGT"
 
     if distinct_email:
@@ -51,12 +85,13 @@ def run_metric_query(
 
     query = f"""
     SELECT 
+        CAMPAIGN_TITLE,
         CAMPAIGN_ID,
         TEAM_ID,
         {count_expr} AS {metric_name}
     FROM MAILSHAKE_API.MAIL_API.{table_name}
     {where_clause}
-    GROUP BY TEAM_ID, CAMPAIGN_ID
+    GROUP BY TEAM_ID, CAMPAIGN_TITLE, CAMPAIGN_ID
     """
 
     df = session.sql(query).to_pandas()
@@ -68,18 +103,23 @@ def run_metric_query(
 
 
 @st.cache_data(ttl=300)
-def run_bounce_query(selected_team: str):
-    where_clause = build_where_clause(selected_team, timestamp_column="UPDATE_DTS")
+def run_bounce_query(selected_team: str, selected_campaign_title: str):
+    where_clause = build_where_clause(
+        selected_team,
+        selected_campaign_title=selected_campaign_title,
+        timestamp_column="UPDATE_DTS"
+    )
 
     query = f"""
     SELECT
+        CAMPAIGN_TITLE,
         CAMPAIGN_ID,
         TEAM_ID,
         COUNT(*) AS BOUNCE_COUNT
     FROM MAILSHAKE_API.MAIL_API.ACTIVITY_REPLIES_TGT
     {where_clause}
       AND LOWER(COALESCE(TYPE, '')) = 'bounce'
-    GROUP BY TEAM_ID, CAMPAIGN_ID
+    GROUP BY TEAM_ID, CAMPAIGN_TITLE, CAMPAIGN_ID
     """
 
     df = session.sql(query).to_pandas()
@@ -91,18 +131,23 @@ def run_bounce_query(selected_team: str):
 
 
 @st.cache_data(ttl=300)
-def run_unsubscribe_query(selected_team: str):
-    where_clause = build_where_clause(selected_team, timestamp_column="UPDATE_DTS")
+def run_unsubscribe_query(selected_team: str, selected_campaign_title: str):
+    where_clause = build_where_clause(
+        selected_team,
+        selected_campaign_title=selected_campaign_title,
+        timestamp_column="UPDATE_DTS"
+    )
 
     query = f"""
     SELECT
+        CAMPAIGN_TITLE,
         CAMPAIGN_ID,
         TEAM_ID,
         COUNT(*) AS UNSUBSCRIBE_COUNT
     FROM MAILSHAKE_API.MAIL_API.ACTIVITY_REPLIES_TGT
     {where_clause}
       AND LOWER(COALESCE(TYPE, '')) = 'unsubscribe'
-    GROUP BY TEAM_ID, CAMPAIGN_ID
+    GROUP BY TEAM_ID, CAMPAIGN_TITLE, CAMPAIGN_ID
     """
 
     df = session.sql(query).to_pandas()
@@ -123,9 +168,9 @@ def make_chart(df: pd.DataFrame, metric_col: str, chart_title: str):
         alt.Chart(chart_df)
         .mark_bar()
         .encode(
-            x=alt.X("CAMPAIGN_ID:N", sort="-y", title="Campaign ID"),
+            x=alt.X("CAMPAIGN_TITLE:N", sort="-y", title="Campaign Title"),
             y=alt.Y(f"{metric_col}:Q", title=metric_col.replace("_", " ").title()),
-            tooltip=["TEAM_ID", "CAMPAIGN_ID", metric_col]
+            tooltip=["TEAM_ID", "CAMPAIGN_TITLE", "CAMPAIGN_ID", metric_col]
         )
         .properties(title=chart_title, height=400)
     )
@@ -220,15 +265,21 @@ def make_combined_line_chart(combined_df: pd.DataFrame):
 
 
 # ----------------------------
-# Team selector
+# Filters
 # ----------------------------
 teams_df = get_teams()
 team_options = ["ALL"] + teams_df["TEAM_ID"].astype(str).tolist()
 
 selected_team = st.selectbox("Select Team", options=team_options)
 
+campaigns_df = get_campaign_titles(selected_team)
+campaign_options = ["ALL"] + campaigns_df["CAMPAIGN_TITLE"].dropna().astype(str).tolist()
+
+selected_campaign_title = st.selectbox("Select Campaign Title", options=campaign_options)
+
 title = "All Teams" if selected_team == "ALL" else f"Team {selected_team}"
-st.subheader(f"Campaign Metrics (Last 24h by UPDATE_DTS) — {title}")
+campaign_label = "All Campaigns" if selected_campaign_title == "ALL" else selected_campaign_title
+st.subheader(f"Campaign Metrics (Last 24h by UPDATE_DTS) — {title} — {campaign_label}")
 
 
 # ----------------------------
@@ -238,6 +289,7 @@ sent_df = run_metric_query(
     table_name="ACTIVITY_SENT",
     metric_name="CAMPAIGN_SENT_MESSAGES",
     selected_team=selected_team,
+    selected_campaign_title=selected_campaign_title,
     distinct_email=True,
     timestamp_column="UPDATE_DTS",
 )
@@ -246,6 +298,7 @@ opens_df = run_metric_query(
     table_name="ACTIVITY_OPENS",
     metric_name="OPEN_COUNT",
     selected_team=selected_team,
+    selected_campaign_title=selected_campaign_title,
     timestamp_column="UPDATE_DTS",
 )
 
@@ -253,6 +306,7 @@ clicks_df = run_metric_query(
     table_name="ACTIVITY_CLICKS",
     metric_name="CLICK_COUNT",
     selected_team=selected_team,
+    selected_campaign_title=selected_campaign_title,
     timestamp_column="UPDATE_DTS",
 )
 
@@ -260,11 +314,12 @@ replies_df = run_metric_query(
     table_name="ACTIVITY_REPLIES",
     metric_name="REPLY_COUNT",
     selected_team=selected_team,
+    selected_campaign_title=selected_campaign_title,
     timestamp_column="UPDATE_DTS",
 )
 
-bounces_df = run_bounce_query(selected_team)
-unsubs_df = run_unsubscribe_query(selected_team)
+bounces_df = run_bounce_query(selected_team, selected_campaign_title)
+unsubs_df = run_unsubscribe_query(selected_team, selected_campaign_title)
 
 combined_team_df = build_combined_team_df(
     sent_df,
@@ -331,42 +386,42 @@ with tab1:
     render_metric_tab(
         sent_df,
         metric_col="CAMPAIGN_SENT_MESSAGES",
-        chart_title="Sent by Campaign (Last 24h by UPDATE_DTS)"
+        chart_title="Sent by Campaign Title (Last 24h by UPDATE_DTS)"
     )
 
 with tab2:
     render_metric_tab(
         opens_df,
         metric_col="OPEN_COUNT",
-        chart_title="Opens by Campaign (Last 24h by UPDATE_DTS)"
+        chart_title="Opens by Campaign Title (Last 24h by UPDATE_DTS)"
     )
 
 with tab3:
     render_metric_tab(
         clicks_df,
         metric_col="CLICK_COUNT",
-        chart_title="Clicks by Campaign (Last 24h by UPDATE_DTS)"
+        chart_title="Clicks by Campaign Title (Last 24h by UPDATE_DTS)"
     )
 
 with tab4:
     render_metric_tab(
         replies_df,
         metric_col="REPLY_COUNT",
-        chart_title="Replies by Campaign (Last 24h by UPDATE_DTS)"
+        chart_title="Replies by Campaign Title (Last 24h by UPDATE_DTS)"
     )
 
 with tab5:
     render_metric_tab(
         bounces_df,
         metric_col="BOUNCE_COUNT",
-        chart_title="Bounces by Campaign (Last 24h by UPDATE_DTS)"
+        chart_title="Bounces by Campaign Title (Last 24h by UPDATE_DTS)"
     )
 
 with tab6:
     render_metric_tab(
         unsubs_df,
         metric_col="UNSUBSCRIBE_COUNT",
-        chart_title="Unsubscribes by Campaign (Last 24h by UPDATE_DTS)"
+        chart_title="Unsubscribes by Campaign Title (Last 24h by UPDATE_DTS)"
     )
 
 with tab7:
